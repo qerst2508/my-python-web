@@ -2,64 +2,126 @@ trigger:
   branches:
     include:
       - main
-      - develop
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 variables:
-  azureSubscription: 'Azure-ARM-Connection'
-  containerRegistry: 'myacr2026.azurecr.io'
-  imageRepository: 'my-python-app'
-  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
-  tag: '$(Build.BuildId)'
+  azureSubscription: 'AzureConnection'
+  resourceGroupName: 'rg-myapp'
+  webAppName: 'myapp-prod-2026'
+  slotName: 'staging'
+
+  # 你要求的 Python 环境（App Service LinuxFxVersion 常用竖线）
+  linuxFxVersion: 'PYTHON|3.14'
+
+  # 构建机上用于测试的 Python 版本（注意：Hosted Agent 未必已提供 3.14）
+  pythonVersion: '3.14'
 
 stages:
-  - stage: BuildPush
-    displayName: '🐳 Build & Push Docker Image'
+  - stage: Build
+    displayName: Build & Test
     jobs:
-      - job: DockerBuildPush
-        pool:
-          vmImage: 'ubuntu-latest'
+      - job: BuildJob
+        displayName: Build
         steps:
-          # Authenticate with Azure Container Registry (replace with your ACR connection)
-          - task: AzureCLI@2
-            displayName: 'Login to Azure Container Registry'
-            inputs:
-              azureSubscription: '$(azureSubscription)' # Service connection name
-              scriptType: 'bash'
-              inlineScript: |
-                az acr login --name $(containerRegistry)
+          - checkout: self
+            fetchDepth: 1
 
-          # Build and push the Docker image
-          - task: Docker@2
-            displayName: 'Build and Push Image'
+          - task: UsePythonVersion@0
+            displayName: 'Use Python $(pythonVersion)'
             inputs:
-              command: 'buildAndPush'
-              repository: $(imageRepository)
-              dockerfile: $(dockerfilePath)
-              containerRegistry: '$(containerRegistry)' # Name of your ACR
-              tags: |
-                $(tag)
-                latest
+              versionSpec: '$(pythonVersion)'
+              addToPath: true
 
-  - stage: Deploy
-    displayName: '🚀 Deploy Container'
-    dependsOn: BuildPush
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install dependencies'
+
+          - script: |
+              pip install pytest pytest-cov
+              pytest -q --junitxml=junit/test-results.xml
+            displayName: 'Run tests'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish test results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: 'junit/test-results.xml'
+              failTaskOnFailedTests: true
+
+          # 打包为 zip，供 Azure Web App Zip Deploy
+          - task: ArchiveFiles@2
+            displayName: 'Archive app'
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish artifact'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/app.zip'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: Deploy_Staging
+    displayName: Deploy to Staging Slot
+    dependsOn: Build
+    condition: succeeded()
     jobs:
-      - deployment: DeployContainerToAppService
-        pool:
-          vmImage: 'ubuntu-latest'
-        environment: 'production'
+      - deployment: DeployStaging
+        displayName: Deploy
+        environment: 'staging'
         strategy:
           runOnce:
             deploy:
               steps:
-                - task: AzureWebAppContainer@1
-                  displayName: 'Deploy to Azure Web App'
+                - download: current
+                  artifact: drop
+
+                # 确保 Slot 的 Runtime 是你要求的 PYTHON|3.14
+                - task: AzureCLI@2
+                  displayName: 'Set runtime on staging slot to $(linuxFxVersion)'
                   inputs:
                     azureSubscription: '$(azureSubscription)'
-                    appName: 'my-python-app-prod' # Your Azure App Service name
-                    containers: '$(containerRegistry)/$(imageRepository):$(tag)'
-                    # If Redis Cache or other services are needed, add them here or use environment variables.
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az webapp config set \
+                        --resource-group "$(resourceGroupName)" \
+                        --name "$(webAppName)" \
+                        --slot "$(slotName)" \
+                        --linux-fx-version "$(linuxFxVersion)"
+
+                - task: AzureWebApp@1
+                  displayName: 'Deploy zip to staging slot'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    appType: 'webAppLinux'
+                    appName: '$(webAppName)'
+                    deployToSlotOrASE: true
+                    resourceGroupName: '$(resourceGroupName)'
+                    slotName: '$(slotName)'
+                    package: '$(Pipeline.Workspace)/drop/app.zip'
+
+  - stage: Swap_to_Prod
+    displayName: Swap Staging -> Production
+    dependsOn: Deploy_Staging
+    condition: succeeded()
+    jobs:
+      - job: Swap
+        displayName: Swap slots
+        steps:
+          - task: AzureAppServiceManage@0
+            displayName: 'Swap slots (staging -> production)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              Action: 'Swap Slots'
+              WebAppName: '$(webAppName)'
+              ResourceGroupName: '$(resourceGroupName)'
+              SourceSlot: '$(slotName)'
+              TargetSlot: 'production'
